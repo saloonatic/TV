@@ -3,15 +3,15 @@ plugins {
 }
 
 android {
-    compileSdk 34
+    compileSdk 33
     flavorDimensions = ["default"]
 
     defaultConfig {
         applicationId "com.fongmi.android.tv"
         minSdk 16
         targetSdk 28
-        versionCode 250
-        versionName "2.5.0"
+        versionCode 258
+        versionName "2.5.8"
         multiDexEnabled true
         ndk { abiFilters "armeabi-v7a" }
         javaCompileOptions {
@@ -33,8 +33,9 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled true
-            shrinkResources true
+            // 首次移植先用不混淆，便于定位问题；稳定后再打开
+            minifyEnabled false
+            shrinkResources false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
@@ -77,20 +78,33 @@ dependencies {
     implementation project(':jianpian')
     implementation project(':forcetech')
     implementation project(':ijkplayer')
+
     implementation 'androidx.multidex:multidex:2.0.1'
+    // appcompat 必须 1.6.1：1.7.0 起 minSdk 21
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.leanback:leanback:1.2.0-alpha04'
     implementation 'androidx.lifecycle:lifecycle-viewmodel:2.6.2'
     implementation 'androidx.room:room-runtime:2.6.1'
+
+    // 播放层：改用公开 Maven 的 media3
+    // （kitkat 原版依赖 16 个从未入库的私有 AAR，无法解析）
+    implementation 'androidx.media3:media3-datasource-okhttp:' + media3Version
+    implementation 'androidx.media3:media3-datasource-rtmp:' + media3Version
+    implementation 'androidx.media3:media3-exoplayer:' + media3Version
+    implementation 'androidx.media3:media3-exoplayer-dash:' + media3Version
+    implementation 'androidx.media3:media3-exoplayer-hls:' + media3Version
+    implementation 'androidx.media3:media3-exoplayer-rtsp:' + media3Version
+    implementation 'androidx.media3:media3-exoplayer-smoothstreaming:' + media3Version
+    implementation 'androidx.media3:media3-ui:' + media3Version
+
     implementation 'cat.ereza:customactivityoncrash:2.4.0'
     implementation 'com.github.bassaer:materialdesigncolors:1.0.0'
     implementation 'com.github.bumptech.glide:glide:4.16.0'
     implementation 'com.github.bumptech.glide:annotations:4.16.0'
     implementation 'com.github.bumptech.glide:okhttp3-integration:4.16.0'
-    implementation 'com.github.ctiao:DanmakuFlameMaster:0.9.25'
     implementation 'com.github.hedzr:android-file-chooser:v1.2.0-final'
     implementation 'com.github.jahirfiquitiva:TextDrawable:1.0.3'
-    implementation('com.github.teamnewpipe:NewPipeExtractor:v0.23.1') { exclude group: 'org.jsoup', module: 'jsoup' }
+    implementation 'com.github.teamnewpipe:NewPipeExtractor:v0.23.1'
     implementation 'com.github.thegrizzlylabs:sardine-android:0.9'
     implementation 'com.github.YarikSOffice:lingver:1.3.0'
     implementation 'com.google.android.material:material:1.11.0'
@@ -99,7 +113,6 @@ dependencies {
     implementation 'com.guolindev.permissionx:permissionx:1.7.1'
     implementation 'com.hierynomus:smbj:0.11.5'
     implementation 'com.tencent.tbs:tbssdk:44286'
-    implementation 'com.github.YarikSOffice:lingver:1.3.0'
     implementation 'me.jessyan:autosize:1.2.1'
     implementation 'org.eclipse.jetty:jetty-client:8.1.22.v20160922'
     implementation('org.eclipse.jetty:jetty-server:8.1.22.v20160922')
@@ -109,25 +122,12 @@ dependencies {
     implementation 'org.greenrobot:eventbus:3.3.1'
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
     implementation('org.simpleframework:simple-xml:2.7.1') { exclude group: 'stax', module: 'stax-api' exclude group: 'xpp3', module: 'xpp3' }
+
+    implementation(ext: 'aar', name: 'danmaku', group: 'fongmi', version: 'release')
     implementation(ext: 'aar', name: 'dlna-core-release', group: 'fongmi', version: 'release')
     implementation(ext: 'aar', name: 'dlna-dmc-release', group: 'fongmi', version: 'release')
     implementation(ext: 'aar', name: 'dlna-dmr-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-common-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-container-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-database-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-datasource-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-datasource-okhttp-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-datasource-rtmp-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-decoder-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-decoder-av1-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-decoder-ffmpeg-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-exoplayer-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-exoplayer-dash-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-exoplayer-hls-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-exoplayer-rtsp-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-exoplayer-smoothstreaming-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-extractor-release', group: 'fongmi', version: 'release')
-    implementation(ext: 'aar', name: 'lib-ui-release', group: 'fongmi', version: 'release')
+
     annotationProcessor 'androidx.room:room-compiler:2.6.1'
     annotationProcessor 'com.github.bumptech.glide:compiler:4.16.0'
 }

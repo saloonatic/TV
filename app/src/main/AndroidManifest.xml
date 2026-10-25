@@ -11,7 +11,7 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
-    <uses-sdk tools:overrideLibrary="com.whl.quickjs.android" />
+    <uses-sdk tools:overrideLibrary="com.whl.quickjs.android,androidx.media3.common,androidx.media3.exoplayer,androidx.media3.exoplayer.dash,androidx.media3.exoplayer.hls,androidx.media3.exoplayer.rtsp,androidx.media3.exoplayer.smoothstreaming,androidx.media3.ui,androidx.media3.datasource,androidx.media3.datasource.okhttp,androidx.media3.datasource.rtmp,androidx.media3.extractor,androidx.media3.decoder,androidx.media3.container" />
 
     <queries>
         <package android:name="idm.internet.download.manager.plus" />
@@ -71,6 +71,18 @@
         <activity
             android:name=".ui.activity.CrashActivity"
             android:process=":error_activity" />
+
+        <receiver
+            android:name=".receiver.ActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="${applicationId}.stop" />
+                <action android:name="${applicationId}.prev" />
+                <action android:name="${applicationId}.next" />
+                <action android:name="${applicationId}.play" />
+                <action android:name="${applicationId}.pause" />
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>
