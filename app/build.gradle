@@ -10,8 +10,8 @@ android {
         applicationId "com.fongmi.android.tv"
         minSdk 16
         targetSdk 28
-        versionCode 277
-        versionName "2.5.8"
+        versionCode 278
+        versionName "2.5.9"
         multiDexEnabled true
         // 电视/盒子只要 armeabi-v7a；模拟器验证时加 -PabiX86 把 x86 带进来（主要给 conscrypt 的 so）
         ndk { abiFilters(*(['armeabi-v7a'] + (project.hasProperty('abiX86') ? ['x86'] : []))) }
