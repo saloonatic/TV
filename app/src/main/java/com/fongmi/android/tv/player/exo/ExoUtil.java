@@ -37,13 +37,24 @@ import java.util.Map;
 
 public class ExoUtil {
 
+    /**
+     * 让设置里的「缓冲区」（1~15）真正生效——基线代码是 {@code new DefaultLoadControl()}，
+     * {@link Setting#getBuffer()} 从未被播放层消费，UI 调大调小行为完全不变。
+     * 映射：minBuffer = buf×10s（下限 15s），maxBuffer = buf×20s；起播/再缓冲阈值取 media3 默认
+     * （2500ms / 5000ms）。buf=1 时 15s/30s，比原 50s/50s 更省内存且响应设置；buf=15 时 150s/300s。
+     */
     public static LoadControl buildLoadControl() {
-        return new DefaultLoadControl();
+        int buf = Math.min(Math.max(Setting.getBuffer(), 1), 15) * 10_000;
+        int min = Math.max(buf, 15_000);
+        int max = Math.max(min * 2, buf * 2);
+        return new DefaultLoadControl.Builder().setBufferDurationsMs(min, max, 2_500, 5_000).setPrioritizeTimeOverSizeThresholds(true).build();
     }
 
     public static TrackSelector buildTrackSelector() {
         DefaultTrackSelector trackSelector = new DefaultTrackSelector(App.get());
-        trackSelector.setParameters(trackSelector.buildUponParameters().setPreferredTextLanguage(Locale.getDefault().getISO3Language()).setForceHighestSupportedBitrate(true).setTunnelingEnabled(Setting.isTunnel()));
+        // forceHighestSupportedBitrate 从 true 改 false：true 会把 ABR 锁死在最高码率档，
+        // 弱网下想降档降不了，表现为「播一会儿卡一下」的周期性停顿（真机复测 2026-10-31）
+        trackSelector.setParameters(trackSelector.buildUponParameters().setPreferredTextLanguage(Locale.getDefault().getISO3Language()).setForceHighestSupportedBitrate(false).setTunnelingEnabled(Setting.isTunnel()));
         return trackSelector;
     }
 
