@@ -70,6 +70,8 @@ public class IjkVideoView extends FrameLayout implements MediaController.MediaPl
     private float mCurrentSpeed;
 
     private boolean mKeepContentOnPlayerReset;
+    /** 本次播放是否直播：由 MediaSource.isLive() 带入，决定 setOptions 走哪组参数。 */
+    private boolean mLiveSource;
 
     private IRenderView.ISurfaceHolder mSurfaceHolder;
     private IMediaPlayer.Listener mListener;
@@ -197,6 +199,7 @@ public class IjkVideoView extends FrameLayout implements MediaController.MediaPl
     }
 
     public void setMediaSource(MediaSource source, long position) {
+        mLiveSource = source.isLive();
         setVideoURI(source.getUri(), source.getHeaders());
         mStartPosition = position;
     }
@@ -452,16 +455,32 @@ public class IjkVideoView extends FrameLayout implements MediaController.MediaPl
         mArtworkView.setVisibility(VISIBLE);
     }
 
+    /**
+     * URL 兜底的直播判定：rtsp/rtmp/udp/rtp/.flv 一律视为直播。
+     * m3u8 无法从 URL 区分直播/点播，不在此判——直播模块会通过 MediaSource.live 显式标记。
+     */
+    private static boolean isLiveUrl(String url) {
+        String u = url.toLowerCase(java.util.Locale.US);
+        return u.contains("rtsp") || u.contains("rtmp") || u.contains("udp") || u.contains("rtp") || u.contains(".flv");
+    }
+
     private void setOptions(Uri uri) {
         String url = uri.toString();
-        mPlayer.setOption(codec, "skip_loop_filter", 48);
+        // 直播（上层标记或 URL 特征命中）走「丢帧不停顿」策略：infbuf 无限缓冲 + 缓冲不满不停帧 +
+        // framedrop=5。这是酷9直播在同类硬件（MStar 918 / 4.3）上实测流畅的参数组合。
+        // 点播保持 packet-buffering=1 / framedrop=1：点播要精确 seek，丢帧会跳画面。
+        boolean live = mLiveSource || isLiveUrl(url);
+        boolean rtspLike = url.contains("rtsp") || url.contains("udp") || url.contains("rtp");
+        mPlayer.setOption(codec, "skip_loop_filter", 0);
         mPlayer.setOption(format, "dns_cache_clear", 1);
         mPlayer.setOption(format, "dns_cache_timeout", -1);
         mPlayer.setOption(format, "fflags", "fastseek");
         mPlayer.setOption(format, "http-detect-range-support", 0);
         mPlayer.setOption(player, "enable-accurate-seek", 0);
-        mPlayer.setOption(player, "framedrop", 1);
-        mPlayer.setOption(player, "max-buffer-size", 15 * 1024 * 1024);
+        mPlayer.setOption(player, "framedrop", live ? 5 : 1);
+        // 点播 30MB：硬解时 ffmpeg 只做 demux，多缓冲能在弱网下显著减少「播一会卡一下」
+        mPlayer.setOption(player, "max-buffer-size", live ? 15 * 1024 * 1024 : 30 * 1024 * 1024);
+        mPlayer.setOption(player, "packet-buffering", live ? 0 : 1);
         mPlayer.setOption(player, "mediacodec", mCurrentDecode);
         mPlayer.setOption(player, "mediacodec-hevc", mCurrentDecode);
         mPlayer.setOption(player, "mediacodec-all-videos", mCurrentDecode);
@@ -474,12 +493,16 @@ public class IjkVideoView extends FrameLayout implements MediaController.MediaPl
         mPlayer.setOption(player, "start-on-prepared", 1);
         mPlayer.setOption(player, "subtitle", 1);
         mPlayer.setOption(format, "protocol_whitelist", "async,cache,crypto,file,http,https,pipe,rtmp,rtp,tcp,tls,udp,data,ijkinject,ijklongurl,ijksegment,ijkhttphook,ijklivehook,ijktcphook,ijkurlhook,ijkmediadatasource");
-        if (url.contains("rtsp") || url.contains("udp") || url.contains("rtp")) {
+        if (live) {
+            // infbuf=1：无限缓冲（读多少收多少，不因 buffer 满而暂停拉流）
             mPlayer.setOption(format, "infbuf", 1);
+            // 探测参数放宽到「够认清流」即可，缩短起播/切台时间（酷9 同款：2s / 4MB）
+            mPlayer.setOption(format, "analyzeduration", 2 * 1000 * 1000);
+            mPlayer.setOption(format, "probesize", 4 * 1024 * 1024);
+        }
+        if (rtspLike) {
             mPlayer.setOption(format, "rtsp_transport", "tcp");
             mPlayer.setOption(format, "rtsp_flags", "prefer_tcp");
-            mPlayer.setOption(format, "probesize", 512 * 1000);
-            mPlayer.setOption(format, "analyzeduration", 2 * 1000 * 1000);
         }
     }
 

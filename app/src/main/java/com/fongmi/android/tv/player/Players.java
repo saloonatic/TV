@@ -79,6 +79,8 @@ public class Players implements Player.Listener, IMediaPlayer.Listener, ParseCal
     private String url;
     private Drm drm;
     private Sub sub;
+    /** 本次播放是否来自直播模块（Channel）：ijk 需要据此走 infbuf/丢帧的直播参数组。 */
+    private boolean live;
 
     private long position;
     private int decode;
@@ -502,23 +504,27 @@ public class Players implements Player.Listener, IMediaPlayer.Listener, ParseCal
     }
 
     public void setMediaSource(String url) {
+        this.live = false;
         setMediaSource(new HashMap<>(), url);
     }
 
     private void setMediaSource(Map<String, String> headers, String url) {
+        this.live = false;
         setMediaSource(headers, url, null, null, new ArrayList<>(), Constant.TIMEOUT_PLAY);
     }
 
     private void setMediaSource(Channel channel, int timeout) {
+        this.live = true;
         setMediaSource(channel.getHeaders(), channel.getUrl(), channel.getFormat(), channel.getDrm(), new ArrayList<>(), timeout);
     }
 
     private void setMediaSource(Result result, int timeout) {
+        this.live = false;
         setMediaSource(result.getHeaders(), result.getRealUrl(), result.getFormat(), result.getDrm(), result.getSubs(), timeout);
     }
 
     private void setMediaSource(Map<String, String> headers, String url, String format, Drm drm, List<Sub> subs, int timeout) {
-        if (isIjk() && ijkPlayer != null) ijkPlayer.setMediaSource(IjkUtil.getSource(this.headers = checkUa(headers), this.url = url), position);
+        if (isIjk() && ijkPlayer != null) ijkPlayer.setMediaSource(IjkUtil.getSource(this.headers = checkUa(headers), this.url = url, live), position);
         if (isExo() && exoPlayer != null) exoPlayer.setMediaItem(ExoUtil.getMediaItem(this.headers = checkUa(headers), UrlUtil.uri(this.url = url), this.format = format, this.drm = drm, checkSub(this.subs = subs), decode), position);
         if (isExo() && exoPlayer != null) exoPlayer.prepare();
         App.post(runnable, timeout);

@@ -16,16 +16,21 @@ import tv.danmaku.ijk.media.player.ui.IjkVideoView;
 public class IjkUtil {
 
     public static MediaSource getSource(Result result) {
-        return getSource(result.getHeaders(), result.getRealUrl());
+        return getSource(result.getHeaders(), result.getRealUrl(), false);
     }
 
     public static MediaSource getSource(Channel channel) {
-        return getSource(channel.getHeaders(), channel.getUrl());
+        // 直播模块：把「这是直播」显式带给 ijk，走 infbuf/丢帧那组参数（酷9 实测有效的策略）
+        return getSource(channel.getHeaders(), channel.getUrl(), true);
     }
 
     public static MediaSource getSource(Map<String, String> headers, String url) {
+        return getSource(headers, url, false);
+    }
+
+    public static MediaSource getSource(Map<String, String> headers, String url, boolean live) {
         Uri uri = UrlUtil.uri(url);
-        return new MediaSource(Players.checkUa(headers), uri);
+        return new MediaSource(Players.checkUa(headers), uri, live);
     }
 
     public static void setSubtitleView(IjkVideoView ijk) {
