@@ -171,6 +171,10 @@ public class VodConfig {
             String notice = Json.safeString(object, "notice");
             config.logo(Json.safeString(object, "logo"));
             App.post(() -> callback.success(notice));
+            // v279：cast/远程推源传来的 config 没有 id，Room update 按主键更新会变成空操作，
+            // 表现为「切了源但重启后回到旧源」。先 find（url 命中则取回带 id 的行，未命中则插入新行）
+            // 拿到真实主键，update() 才真正落库并刷新 time（换壳重启后靠 Config.vod() 取回新配置）。
+            config = Config.find(config, 0);
             config.json(object.toString()).update();
             App.post(callback::success);
         } catch (Throwable e) {
