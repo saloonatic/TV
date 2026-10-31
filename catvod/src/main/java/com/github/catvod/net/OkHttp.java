@@ -2,6 +2,7 @@ package com.github.catvod.net;
 
 import android.os.Build;
 import android.text.TextUtils;
+import android.util.Log;
 
 import androidx.collection.ArrayMap;
 
@@ -11,6 +12,7 @@ import com.github.catvod.net.interceptor.ResponseInterceptor;
 import com.github.catvod.utils.Path;
 
 import java.net.ProxySelector;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -54,7 +56,7 @@ public class OkHttp {
     }
 
     public void setDoh(Doh doh) {
-        OkHttpClient dohClient = new OkHttpClient.Builder().cache(new Cache(Path.doh(), CACHE)).build();
+        OkHttpClient dohClient = getBuilder().cache(new Cache(Path.doh(), CACHE)).build();
         dns = doh.getUrl().isEmpty() ? null : new DnsOverHttps.Builder().client(dohClient).url(HttpUrl.get(doh.getUrl())).bootstrapDnsHosts(doh.getHosts()).build();
         client = null;
     }
@@ -143,7 +145,25 @@ public class OkHttp {
     }
 
     private static OkHttpClient.Builder getBuilder() {
-        OkHttpClient.Builder builder = new OkHttpClient.Builder().addInterceptor(new RequestInterceptor()).addNetworkInterceptor(new ResponseInterceptor()).connectTimeout(TIMEOUT, TimeUnit.MILLISECONDS).readTimeout(TIMEOUT, TimeUnit.MILLISECONDS).writeTimeout(TIMEOUT, TimeUnit.MILLISECONDS).dns(dns()).hostnameVerifier((hostname, session) -> true).followRedirects(true).sslSocketFactory(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP ? new Tls12() : new SSLCompat(), SSLCompat.TM);
+        OkHttpClient.Builder builder = new OkHttpClient.Builder().addInterceptor(new RequestInterceptor()).addNetworkInterceptor(new ResponseInterceptor()).connectTimeout(TIMEOUT, TimeUnit.MILLISECONDS).readTimeout(TIMEOUT, TimeUnit.MILLISECONDS).writeTimeout(TIMEOUT, TimeUnit.MILLISECONDS).dns(dns()).hostnameVerifier((hostname, session) -> true).followRedirects(true);
+        /*
+         * TLS 栈选择：
+         *   < API19(4.3 及以下) → Conscrypt（BoringSSL，带 GCM/新 PRF）；不可用时退回 Tls12
+         *   API19/20(4.4-4.4W)  → 系统栈 + Tls12（4.4 的 OpenSSL 已带 GCM）
+         *   >= API21            → 系统栈 + SSLCompat
+         */
+        if (Build.VERSION.SDK_INT < ConscryptTls.MIN_API) {
+            ConscryptTls tls = ConscryptTls.create();
+            if (tls != null) {
+                builder.sslSocketFactory(tls, SSLCompat.TM).connectionSpecs(Collections.singletonList(ConscryptTls.OKHTTP_SPEC));
+                ConscryptTls.installDefault();
+            } else {
+                Log.w(ConscryptTls.TAG, "fallback to system TLS stack: " + ConscryptTls.status());
+                builder.sslSocketFactory(new Tls12(), SSLCompat.TM);
+            }
+        } else {
+            builder.sslSocketFactory(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP ? new Tls12() : new SSLCompat(), SSLCompat.TM);
+        }
         builder.proxySelector(get().proxy ? selector() : defaultSelector);
         return builder;
     }

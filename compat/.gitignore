@@ -1,0 +1,2 @@
+# mkcompat.sh 的中间产物（解包出来的旧 class + 编译输出）
+out/

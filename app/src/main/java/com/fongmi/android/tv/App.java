@@ -16,6 +16,7 @@ import androidx.multidex.MultiDexApplication;
 import com.fongmi.android.tv.api.config.LiveConfig;
 import com.fongmi.android.tv.ui.activity.CrashActivity;
 import com.fongmi.android.tv.utils.LanguageUtil;
+import com.fongmi.android.tv.utils.NativeCompat;
 import com.fongmi.android.tv.utils.Notify;
 import com.github.catvod.Init;
 import com.github.catvod.bean.Doh;
@@ -107,6 +108,8 @@ public class App extends MultiDexApplication {
     @Override
     public void onCreate() {
         super.onCreate();
+        // 必须最先做：把 dladdr 的正确实现塞进进程符号表，后面 guard .so 才会绑到它
+        NativeCompat.install();
         Notify.createChannel();
         LanguageUtil.init(this);
         Logger.addLogAdapter(getLogAdapter());
