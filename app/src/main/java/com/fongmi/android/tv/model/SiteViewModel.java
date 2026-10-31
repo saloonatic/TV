@@ -10,6 +10,7 @@ import androidx.lifecycle.ViewModel;
 import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.Constant;
 import com.fongmi.android.tv.R;
+import com.fongmi.android.tv.api.loader.JarLoader;
 import com.fongmi.android.tv.api.config.VodConfig;
 import com.fongmi.android.tv.bean.Danmu;
 import com.fongmi.android.tv.bean.Episode;
@@ -76,10 +77,12 @@ public class SiteViewModel extends ViewModel {
             if (site.getType() == 3) {
                 Spider spider = site.recent().spider();
                 String homeContent = spider.homeContent(true);
+                JarLoader.note("homeContent -> " + brief(homeContent));
                 SpiderDebug.log(homeContent);
                 Result result = Result.fromJson(homeContent);
                 if (result.getList().size() > 0) return result;
                 String homeVideoContent = spider.homeVideoContent();
+                JarLoader.note("homeVideoContent -> " + brief(homeVideoContent));
                 SpiderDebug.log(homeVideoContent);
                 result.setList(Result.fromJson(homeVideoContent).getList());
                 return result;
@@ -103,6 +106,7 @@ public class SiteViewModel extends ViewModel {
             if (site.getType() == 3) {
                 Spider spider = site.recent().spider();
                 String categoryContent = spider.categoryContent(tid, page, filter, extend);
+                JarLoader.note("cat " + key + "/" + tid + " p" + page + " -> " + brief(categoryContent));
                 SpiderDebug.log(categoryContent);
                 return Result.fromJson(categoryContent);
             } else {
@@ -294,6 +298,13 @@ public class SiteViewModel extends ViewModel {
         this.search.postValue(result);
     }
 
+    /** 诊断用：把爬虫返回的原始 JSON 压成一行短摘要，便于判断是「空串」还是「有结构但没数据」。 */
+    private static String brief(String s) {
+        if (s == null) return "null";
+        String t = s.length() > 160 ? s.substring(0, 160) : s;
+        return "len=" + s.length() + " | " + t.replace('\n', ' ').replace('\r', ' ');
+    }
+
     private void execute(MutableLiveData<Result> result, Callable<Result> callable) {
         if (executor != null) executor.shutdownNow();
         executor = Executors.newFixedThreadPool(2);
@@ -303,6 +314,9 @@ public class SiteViewModel extends ViewModel {
                 result.postValue(executor.submit(callable).get(Constant.TIMEOUT_VOD, TimeUnit.MILLISECONDS));
             } catch (Throwable e) {
                 if (e instanceof InterruptedException || Thread.interrupted()) return;
+                // 诊断：这里原来只把结果置空，用户侧表现为「点分类后一片空白、没有任何提示」，
+                // 而真正的异常（多半是爬虫 dex 用了 API19+ 的类/方法）被 printStackTrace 扔掉。
+                JarLoader.note("vod request FAIL", e.getCause() != null ? e.getCause() : e);
                 if (e.getCause() instanceof ExtractException) result.postValue(Result.error(e.getCause().getMessage()));
                 else result.postValue(Result.empty());
                 e.printStackTrace();

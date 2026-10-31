@@ -129,8 +129,12 @@ public class VodConfig {
     }
 
     private void loadCache(Callback callback, Throwable e) {
-        if (!TextUtils.isEmpty(config.getJson())) checkJson(Json.parse(config.getJson()).getAsJsonObject(), callback);
-        else App.post(() -> callback.error(Notify.getError(R.string.error_config_get, e)));
+        // 诊断补丁：配置拉取失败时原来完全静默（只是退回缓存），用户切源会以为「没反应」。加明确提示。
+        android.util.Log.e("VodConfig", "config fetch failed: " + config.getUrl() + " <- " + e, e);
+        if (!TextUtils.isEmpty(config.getJson())) {
+            App.post(() -> Notify.show("配置获取失败，已使用上次缓存"));
+            checkJson(Json.parse(config.getJson()).getAsJsonObject(), callback);
+        } else App.post(() -> callback.error(Notify.getError(R.string.error_config_get, e)));
     }
 
     private void loadConfigCache(Callback callback) {
