@@ -18,6 +18,7 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
@@ -69,6 +70,15 @@ public class JarLoader {
 
     /** 串行化「打补丁 + 建 loader + Init.init」整段，避免两个线程同时首次初始化同一个壳。 */
     private static final Object GUARD_LOCK = new Object();
+
+    /**
+     * 本进程是否已经为某个加固 jar 建过 DexClassLoader。
+     *
+     * <p>用来决定要不要 {@link #purgeGuardOdex()}：第一次加载时进程里还没有任何 loader
+     * 映射着 {@code guard.dex}，删它只是白丢一次 dexopt（真机 3~4s）；此后旧 inode 可能
+     * 仍被映射，就必须每次 unlink。</p>
+     */
+    private static volatile boolean guardLoaderEverCreated = false;
 
     private final ConcurrentHashMap<String, DexClassLoader> loaders;
     private final ConcurrentHashMap<String, Method> methods;
@@ -150,6 +160,7 @@ public class JarLoader {
             }
         }
         final DexClassLoader loader;
+        ClassLoader guardReady = null;
         synchronized (GUARD_LOCK) {
             // 双检：并发的另一线程可能刚 init 完同一个壳，这里必须再看一次。
             DexClassLoader again = GUARD_INITED.get(pin);
@@ -170,42 +181,67 @@ public class JarLoader {
             } catch (Throwable e) {
                 diag("  InitOrigin MISSING", e);
             }
-            purgeGuardOdex();
-            if (guardNative && invokeInit(key)) {
-                // init 成功才钉住；失败的不缓存，留给下次重试（壳崩的时候进程已经没了，不在此列）
-                GUARD_INITED.put(pin, loader);
-                diag("guard loader pinned for process lifetime: " + file.getName());
+            // 冷启动第一次加载加固壳时，本进程里还没有任何壳的映射，purge 是纯浪费：上次进程
+            // 写好的 guard.dex 只要 modtime 对得上，dalvik 会直接复用，能省一次 dexopt（真机约 3~4s）。
+            // 一旦本进程建过 guard loader，旧 inode 就可能仍被映射，此后每次都必须 unlink。
+            // 注意这段必须只在 guardNative 里跑：普通爬虫 jar 根本不碰 cache/sharedb。
+            if (guardNative) {
+                if (guardLoaderEverCreated) purgeGuardOdex();
+                else diag("first guard load in this process, keep existing odex (skip purge)");
+                guardLoaderEverCreated = true;
+                // invokeInit 返回 true 只代表反射调用没抛异常，壳完全可能「正常返回但没解出 loader」
+                // （native 里失败只写自己的日志）。这种半死的壳一旦 pin 住，本进程内该源就永久坏掉，
+                // 所以必须再确认 Init.loader() 真是个 ClassLoader 才允许钉。
+                guardReady = invokeInit(key) ? guardLoader(loader) : null;
+                if (guardReady != null) {
+                    // init 成功才钉住；失败的不缓存，留给下次重试（壳崩的时候进程已经没了，不在此列）
+                    GUARD_INITED.put(pin, loader);
+                    diag("guard loader pinned for process lifetime: " + file.getName());
+                } else {
+                    diag("guard init incomplete, NOT pinned (retry on next switch): " + file.getName());
+                }
             }
         }
         putProxy(key);
-        diagGuardLoader(loader);
+        if (guardNative) diagGuardLoader(guardReady);
     }
 
     /**
-     * 诊断壳自己的那个 DexClassLoader（{@code Init.loader()}）到底有没有造出来。
+     * 取壳自己的那个 DexClassLoader（{@code Init.loader()}），拿不到或类型不对就返回 null。
      *
      * <p>加固包的调用链是：{@code Init.init(ctx)} → native {@code DexNative.getLoader(ctx)}
      * 解出真 dex 并 new 一个 DexClassLoader 存进 {@code Init.loader}；随后
      * {@code BaseSpiderGuard.&lt;init&gt;} 里 {@code Init.getSpider(getClass().getName())}
      * 用这个 loader 反射出真正的爬虫类。任一步失败都只表现为
      * {@code BaseSpiderGuard.init} 的 NPE（delegate 字段是 null），原始异常被吞掉。
+     *
+     * <p>返回值同时用于判断「这次 init 是否真的可复用」：只有非 null 才允许 pin。
      */
-    private void diagGuardLoader(DexClassLoader jarLoader) {
+    private ClassLoader guardLoader(DexClassLoader jarLoader) {
         try {
             Class<?> init = jarLoader.loadClass("com.github.catvod.spider.Init");
             Object l = init.getMethod("loader").invoke(null);
             diag("  Init.loader -> " + l);
-            if (!(l instanceof ClassLoader)) return;
-            ClassLoader gl = (ClassLoader) l;
-            if (l instanceof BaseDexClassLoader) diag("  guard loader elem=" + GuardPatch.elemCount((BaseDexClassLoader) l));
-            try {
-                Class<?> c = gl.loadClass("com.github.catvod.spider.InitOrigin");
-                diag("  guard InitOrigin OK, loader=" + c.getClassLoader());
-            } catch (Throwable t) {
-                diag("  guard InitOrigin FAIL", t);
-            }
+            if (l instanceof ClassLoader) return (ClassLoader) l;
+            diag("  Init.loader is " + (l == null ? "null" : l.getClass().getName()) + ", not a ClassLoader");
         } catch (Throwable t) {
             diag("  Init.loader reflect FAIL", t);
+        }
+        return null;
+    }
+
+    /** 诊断壳 loader 是否真能加载出 InitOrigin（4.3 上 dexElements 为 0 时这里会失败）。 */
+    private void diagGuardLoader(ClassLoader gl) {
+        if (gl == null) {
+            diag("  guard loader absent, skip InitOrigin probe");
+            return;
+        }
+        try {
+            if (gl instanceof BaseDexClassLoader) diag("  guard loader elem=" + GuardPatch.elemCount((BaseDexClassLoader) gl));
+            Class<?> c = gl.loadClass("com.github.catvod.spider.InitOrigin");
+            diag("  guard InitOrigin OK, loader=" + c.getClassLoader());
+        } catch (Throwable t) {
+            diag("  guard InitOrigin FAIL", t);
         }
     }
 
@@ -304,6 +340,46 @@ public class JarLoader {
         }
     }
 
+    /**
+     * 原子落盘：先写同目录临时文件，fsync，再 rename 覆盖目标。
+     *
+     * <p>为什么不能照原样 {@code Path.write}（就地 truncate）：缓存 jar 很可能正被某个
+     * {@code DexClassLoader} mmap 着（同一个 URL 的内容更新时，旧 loader 还在用旧文件）。
+     * 就地截断会让映射页失效，之后任何一次「按类名 strcmp」都是 SIGBUS/BUS_ADRERR ——
+     * 与 16:38 那次 guard.dex 崩溃是同一类故障，只是换了个文件。
+     *
+     * <p>rename 在 Linux 上是原子的：旧 inode 因为还被人映射而继续有效，新内容落在另一个
+     * inode 上，读者要么看到完整的旧文件、要么看到完整的新文件，不存在「半个 jar」。
+     */
+    private static File writeAtomic(File target, byte[] data) throws IOException {
+        File tmp = new File(target.getParentFile(), target.getName() + ".part");
+        FileOutputStream fos = new FileOutputStream(tmp);
+        try {
+            fos.write(data);
+            fos.flush();
+            // 避免掉电/进程被杀后留下「长度对、中间是空洞」的 jar
+            fos.getFD().sync();
+        } finally {
+            try {
+                fos.close();
+            } catch (IOException ignored) {
+            }
+        }
+        if (!tmp.renameTo(target)) {
+            // 个别实现上 rename 不能覆盖已存在文件：先 unlink 再 rename。
+            // unlink 不影响仍被映射的旧 inode，所以这里不会引发 SIGBUS。
+            if (target.exists() && !target.delete()) {
+                tmp.delete();
+                throw new IOException("cannot replace " + target);
+            }
+            if (!tmp.renameTo(target)) {
+                tmp.delete();
+                throw new IOException("rename failed: " + target);
+            }
+        }
+        return target;
+    }
+
     // 诊断补丁：原实现在下载失败时 catch 住异常、直接返回一个「并不存在」的文件路径，
     // 上层照样 new DexClassLoader → 全类 ClassNotFoundException → SpiderNull，
     // 用户侧表现为「切源没反应、首页不刷新、也没有任何报错」。这里改为：重试 + 落日志 + 返回 null。
@@ -322,7 +398,7 @@ public class JarLoader {
             try {
                 byte[] data = OkHttp.newCall(url).execute().body().bytes();
                 if (data == null || data.length == 0) throw new IOException("empty body");
-                File file = Path.write(Path.jar(url), data);
+                File file = writeAtomic(Path.jar(url), data);
                 diag("jar ok #" + i + " (" + (System.currentTimeMillis() - start) + "ms, " + data.length + " bytes) " + url);
                 failed.remove(url);
                 return file;
@@ -357,7 +433,7 @@ public class JarLoader {
             is.close();
             byte[] data = bos.toByteArray();
             if (data.length == 0) throw new IOException("empty body");
-            File file = Path.write(Path.jar(url), data);
+            File file = writeAtomic(Path.jar(url), data);
             diag("jar ok by HttpURLConnection (" + data.length + " bytes) " + url);
             return file;
         } catch (Throwable e) {
@@ -371,23 +447,45 @@ public class JarLoader {
         }
     }
 
-    // 同时输出到 logcat 和 diag.log。
-    // ⚠️ 4.3 模拟器的 /sdcard 是只读的（Read-only file system），写 /sdcard 会静默失败，
-    // 所以主通道必须是 App 私有目录 files/diag.log；/sdcard 那份只当老电视上的附加副本。
+    /** diag.log 单文件上限，超过就滚成 diag.1.log（只留一代，磁盘占用 ≤ 512KB）。 */
+    private static final long DIAG_MAX = 256 * 1024L;
+    /** 落盘开关缓存：files/no_diag 存在则只走 logcat。 */
+    private static Boolean diagFileCached = null;
+    private static final Object DIAG_LOCK = new Object();
+
+    private static boolean diagEnabled() {
+        if (diagFileCached != null) return diagFileCached;
+        try {
+            diagFileCached = !new File(App.get().getFilesDir(), "no_diag").exists();
+        } catch (Throwable t) {
+            return true; // 拿不到目录时让下面写文件那层 try 去失败，不影响主流程
+        }
+        return diagFileCached;
+    }
+
+    /** 超限就滚动：diag.log -> diag.1.log（旧的直接删）。滚不动就清空，绝不能让它无限长。 */
+    private static void rollDiag(File f) {
+        File old = new File(f.getParentFile(), "diag.1.log");
+        old.delete();
+        if (!f.renameTo(old)) f.delete();
+    }
+
+    // 同时输出到 logcat 和 diag.log（files/no_diag 存在时只走 logcat）。
+    // ⚠️ 4.3 的 /sdcard 常常只读，历史上那条「附加副本」在真机上从来没写成功过，
+    // 只会让每行日志多一次失败的 open 系统调用，已去掉。
     private static void diag(String msg) {
         Log.e("JarLoader", msg);
+        if (!diagEnabled()) return;
         String line = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(new Date()) + " " + msg + "\n";
-        try {
-            FileWriter w = new FileWriter(new File(App.get().getFilesDir(), "diag.log"), true);
-            w.write(line);
-            w.close();
-        } catch (Throwable ignored) {
-        }
-        try {
-            FileWriter w = new FileWriter("/sdcard/fongmi_diag.log", true);
-            w.write(line);
-            w.close();
-        } catch (Throwable ignored) {
+        synchronized (DIAG_LOCK) {
+            try {
+                File f = new File(App.get().getFilesDir(), "diag.log");
+                if (f.length() > DIAG_MAX) rollDiag(f);
+                FileWriter w = new FileWriter(f, true);
+                w.write(line);
+                w.close();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
