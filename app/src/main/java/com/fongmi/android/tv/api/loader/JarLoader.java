@@ -82,7 +82,20 @@ public class JarLoader {
      */
     private static final ConcurrentHashMap<String, Boolean> GUARD_FAILED = new ConcurrentHashMap<>();
 
-    /** dex 字符串池里出现即说明引用了 4.3 上不存在的 API 24/26 类（类初始化直接 dvmAbort）。 */
+    /** loaders 的 key（通常是 jar URL 的 md5）→ 壳/jar 内容 pin（files md5），getSpider 回查用。 */
+    private static final ConcurrentHashMap<String, String> JAR_PINS = new ConcurrentHashMap<>();
+
+    /**
+     * 已经在本设备上「实证可用」的 jar pin：至少一个爬虫类成功实例化过。
+     * 之后的爬虫初始化不再武装 —— dvmAbort 类崩溃只能靠首次初始化时抓现行。
+     */
+    private static final ConcurrentHashMap<String, Boolean> SPIDER_PROVEN = new ConcurrentHashMap<>();
+
+    /**
+     * v279 build9 起仅作诊断记录用：字符串池命中只说明「引用了」4.3 上不存在的 API 24/26 类，
+     * 不代表该类会被初始化（肥猫 jar 含 Ljava/util/stream/ 在 4.3 完全正常的实证），
+     * 不能作为拒绝加载的依据。真正致命与否由 getSpider() 的运行时武装 + 崩溃黑名单判定。
+     */
     private static final String[] API24_TOKENS = {"Ljava/nio/file/", "Ljava/time/", "Ljava/util/stream/"};
 
     /** 防止重复调度进程重启。 */
@@ -145,6 +158,7 @@ public class JarLoader {
         // key 用**文件内容 md5** 而不是路径：同一个源换个 URL 写法（加 query、大小写、重定向）
         // 会落到不同的缓存文件名上，但字节一模一样、壳也是同一个，路径 key 就漏了。
         String pin = pinKey(file);
+        JAR_PINS.put(key, pin);
         DexClassLoader inited = GUARD_INITED.get(pin);
         if (inited != null) {
             loaders.put(key, inited);
@@ -170,14 +184,24 @@ public class JarLoader {
         // pin 是壳 jar 内容 md5：源更新 jar → pin 变 → 黑名单自然失效 → 自动恢复尝试。
         checkArmedMarker();
 
-        // 崩溃黑名单：有进程为这个壳死过，直接跳过
+        // 崩溃黑名单：有进程为这个壳/jar 死过，直接跳过
         if (guardCrashedContains(pin)) {
             GUARD_FAILED.put(pin, Boolean.TRUE);
-            diag("guard shell killed a previous process during init (crashed list), skip: " + file.getName());
+            diag("guard/jar killed a previous process during init (crashed list), skip: " + file.getName());
             if (notified.putIfAbsent("crash:" + pin, System.currentTimeMillis()) == null) {
-                App.post(() -> Notify.show("该源解码壳在 4.3 上初始化崩溃，已跳过"));
+                App.post(() -> Notify.show("该源爬虫包在 4.3 上初始化崩溃，已跳过（源更新后会自动重试）"));
             }
             return;
+        }
+
+        // 装载即武装（v279 build10）：把本 jar 的 pin 写进 guard_armed，进程若在「装载 →
+        // 首页流程走完」之间硬崩（dvmAbort 连异常都抛不出），下个进程凭标记把 pin 拉黑。
+        // 出口三选一：壳 Init 成功 / homeContent 成功（markHomeOk）/ 120s 定时器兜底
+        //（浏览页后很久才进首页的场景，别让标记挂着过夜）。
+        if (!SPIDER_PROVEN.containsKey(pin)) {
+            armGuardInit(pin);
+            App.post(() -> disarmGuardInit(pin), 120_000);
+            diag("jar armed for crash watch: " + file.getName());
         }
 
         // 防护补丁：部分源爬虫（饭太硬/王二小等）内嵌 guard .so，在 Android 4.x 上
@@ -208,20 +232,14 @@ public class JarLoader {
         }
         final DexClassLoader loader;
         ClassLoader guardReady = null;
-        // API 预检（v279）：无壳爬虫 jar 里若引用了 java.nio.file / java.time / java.util.stream
-        // （API 24/26），Dalvik 在类初始化时直接 dvmAbort（fault addr deadd00d），进程连异常都
-        // 抛不出来——讴歌/茶杯狐两个源实测一进首页就闪退、反复崩。在加载前扫 dex 字符串池，
-        // 命中就整包拒绝，把「闪退」变成「该源不可用」。
-        if (!guardNative) {
-            String hit = findBlockedApiRef(file);
-            if (hit != null) {
-                diag("skip jar, references API24+ class " + hit + " (dvmAbort on 4.3): " + file.getName());
-                if (notified.putIfAbsent("api:" + pin, System.currentTimeMillis()) == null) {
-                    App.post(() -> Notify.show("该源爬虫需要 Android 8+ 的 API，4.x 无法使用，已跳过"));
-                }
-                return;
-            }
-        }
+        // v279 build9：撤掉 build6 的「API24 字符串池预检」（扫 dex 命中 java.nio.file /
+        // java.time / java.util.stream 就整包拒绝）。误伤实证：肥猫 jar（cd1e8ad5）主 dex
+        // 里就有 Ljava/util/stream/，在 4.3 上跑了很久完全正常——**字符串池命中 ≠ 该类会被
+        // 初始化**，静态扫描分不清「必崩」和「带着但没执行」，把能用的源误杀成首页空白。
+        // 对策改成「运行时实证 + 崩溃自学习」：getSpider() 的首次爬虫类初始化前后武装/
+        // 解除 files/guard_armed，dvmAbort 杀不掉解除动作 → 下个进程把 pin 记入
+        // files/guard_crashed 永久跳过。代价：坏 jar（讴歌/茶杯狐）首次使用会崩一次，
+        // 之后静默降级；好 jar 零影响。pin 是 jar 内容 md5，源更新自动重置。
         synchronized (GUARD_LOCK) {
             // 双检：并发的另一线程可能刚 init 完同一个壳，这里必须再看一次。
             DexClassLoader again = GUARD_INITED.get(pin);
@@ -273,16 +291,16 @@ public class JarLoader {
                 // invokeInit 返回 true 只代表反射调用没抛异常，壳完全可能「正常返回但没解出 loader」
                 // （native 里失败只写自己的日志）。这种半死的壳一旦 pin 住，本进程内该源就永久坏掉，
                 // 所以必须再确认 Init.loader() 真是个 ClassLoader 才允许钉。
-                //武装标记（v279 build8）：若进程死在下面的 init 里（dvmAbort），guard_armed 留存，
-                // 下个进程据此把 pin 记入崩溃黑名单。正常返回（成功或优雅失败）都立即解除。
-                armGuardInit(pin);
+                // 武装已在装载层统一做（build10）：进程死在下面的 init 里 → 标记留存 → 拉黑。
                 boolean initOk = invokeInit(key);
-                disarmGuardInit();
                 guardReady = initOk ? guardLoader(loader) : null;
                 if (guardReady != null) {
                     // init 成功才钉住；失败的不缓存，留给下次重试（壳崩的时候进程已经没了，不在此列）
                     GUARD_INITED.put(pin, loader);
                     diag("guard loader pinned for process lifetime: " + file.getName());
+                    // 壳 Init 成功 = 本 jar 冷路径实证通过，解除武装（后面的崩锅不归它背）
+                    SPIDER_PROVEN.put(pin, Boolean.TRUE);
+                    disarmGuardInit(pin);
                 } else {
                     // v279：失败也要记下来。失败不拦的话，下一次取爬虫会再 init 同一个壳 → SIGSEGV
                     GUARD_FAILED.put(pin, Boolean.TRUE);
@@ -352,58 +370,6 @@ public class JarLoader {
         return false;
     }
 
-    /**
-     * 无壳爬虫 jar 的 API 预检：dex 的字符串池以 MUTF-8 存类描述符原文，所以直接按字节搜
-     * {@code Ljava/nio/file/} 之类的前缀即可。命中说明 jar 里<strong>某处</strong>引用了
-     * 4.3 上不存在的类——虽然未必执行到，但一旦执行到就是 dvmAbort（连异常都抛不出），
-     * 这类源在 4.3 上本来就没法用，整包拒绝换来「不闪退」。扫不了（坏 zip 等）就放行，
-     * 交给原有流程处理。
-     *
-     * @return 命中的 token，没命中返回 null
-     */
-    private static String findBlockedApiRef(File file) {
-        ZipFile zip = null;
-        try {
-            zip = new ZipFile(file);
-            Enumeration<? extends ZipEntry> entries = zip.entries();
-            while (entries.hasMoreElements()) {
-                ZipEntry entry = entries.nextElement();
-                if (!entry.getName().endsWith(".dex")) continue;
-                ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                InputStream is = zip.getInputStream(entry);
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
-                is.close();
-                byte[] dex = bos.toByteArray();
-                for (String token : API24_TOKENS) {
-                    if (contains(dex, token.getBytes("UTF-8"))) return token;
-                }
-            }
-        } catch (Throwable e) {
-            diag("api scan skipped (unreadable jar): " + file.getName());
-            return null;
-        } finally {
-            if (zip != null) try {
-                zip.close();
-            } catch (Exception ignored) {
-            }
-        }
-        return null;
-    }
-
-    private static boolean contains(byte[] data, byte[] pattern) {
-        if (pattern.length == 0 || data.length < pattern.length) return false;
-        outer:
-        for (int i = 0; i <= data.length - pattern.length; i++) {
-            for (int j = 0; j < pattern.length; j++) {
-                if (data[i + j] != pattern[j]) continue outer;
-            }
-            return true;
-        }
-        return false;
-    }
-
     private static String readText(File file) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         InputStream is = new FileInputStream(file);
@@ -468,17 +434,18 @@ public class JarLoader {
     }
 
     /**
-     * 跨进程崩溃记忆（v279 build8）。两个文件：
+     * 跨进程崩溃记忆（v279 build10）。两个文件：
      * <ul>
-     *   <li>{@code files/guard_armed} —— 武装标记，内容 {@code "<pin>|<ts>|<pid>"}。
-     *       壳首次 Init.init 前写入，正常返回后删除。SIGSEGV 跳过删除 → 留存即
-     *       「上个进程死在 init 途中」的铁证（王二小 wex 壳实证：fault addr deadd00d）。</li>
-     *   <li>{@code files/guard_crashed} —— 崩溃黑名单，每行一个 pin。入口发现别的 pid 的
-     *       armed 标记（10min 内，排除 force-stop 等陈旧残留）时把 pin 追加进来；
-     *       命中的壳永久跳过。pin 是壳 jar 内容 md5，源更新 jar → pin 变 → 自动解禁。</li>
+     *   <li>{@code files/guard_armed} —— 武装标记，内容 {@code "<pin,..>|<ts>|<pid>"}（pin 列表）。
+     *       jar 装载时把自己 pin 加入（SIGKILL/SIGSEGV 都不会移除），三个出口移除：
+     *       壳 Init 成功、homeContent 成功（{@link #markHomeOk}）、装载 120s 后的定时器。
+     *       实证：讴歌 jar 第一个爬虫实例化成功后，首页遍历到后面的站点时才在 dvmInitClass
+     *       里 dvmAbort —— 「首次爬虫成功」不算数，必须整个首页流程走完才算干净。</li>
+     *   <li>{@code files/guard_crashed} —— 崩溃黑名单，每行一个 pin。下个进程发现**别的 pid**
+     *       的 armed 标记（10min 内，排除 force-stop 等陈旧残留）时，把其中**未实证**的 pin
+     *       全部记入；命中的 jar 永久跳过。同一进程多 jar 全被拉黑属已知代价（崩溃进程无法
+     *       定位是哪个 jar 干的），pin 是 jar 内容 md5，源更新 → pin 变 → 自动解禁。</li>
      * </ul>
-     * 误伤面：只有「进程恰好在 init 的 ~2s 窗口内被外部杀死」会误记健康壳，概率极低，
-     * 且可通过删除 guard_crashed 恢复；换来的是崩溃源永久静默跳过、不再弹崩溃框。
      */
     private static File guardArmedFile() {
         return new File(App.get().getFilesDir(), "guard_armed");
@@ -488,7 +455,7 @@ public class JarLoader {
         return new File(App.get().getFilesDir(), "guard_crashed");
     }
 
-    /** 入口检查：上个进程留下的武装标记 → 记黑名单；本进程自己的标记 → 忽略（init 流程在管）。 */
+    /** 入口检查：上个进程留下的 armed 标记 → 未实证的 pin 记黑名单；本进程自己的 → 忽略。 */
     private static void checkArmedMarker() {
         try {
             File f = guardArmedFile();
@@ -500,35 +467,87 @@ public class JarLoader {
                 f.delete();
                 return;
             }
-            String pin = s.substring(0, i1);
             long ts = Long.parseLong(s.substring(i1 + 1, i2));
             int pid = Integer.parseInt(s.substring(i2 + 1));
             if (pid == android.os.Process.myPid()) return;
             //noinspection ResultOfMethodCallIgnored
             f.delete();
             if (System.currentTimeMillis() - ts > 600_000L) {
-                diag("stale guard_armed (>10min, external kill?), discarded: " + pin);
+                diag("stale guard_armed (>10min, external kill?), discarded: " + s);
                 return;
             }
-            guardCrashedAdd(pin);
-            diag("guard shell killed previous process (pid " + pid + ") during init, blacklisted: " + pin);
+            int blacklisted = 0;
+            for (String pin : s.substring(0, i1).split(",")) {
+                if (pin.isEmpty() || SPIDER_PROVEN.containsKey(pin) || guardCrashedContains(pin)) continue;
+                guardCrashedAdd(pin);
+                blacklisted++;
+            }
+            if (blacklisted > 0) diag("previous process (pid " + pid + ") died with armed jars, blacklisted " + blacklisted + " pin(s)");
         } catch (Throwable t) {
             diag("checkArmedMarker FAIL", t);
         }
     }
 
+    /** 把 pin 加进武装标记；发现别 pid 的残留直接丢弃重建（正常已被 checkArmedMarker 清掉）。 */
     private static void armGuardInit(String pin) {
         try {
-            writeAtomic(guardArmedFile(), (pin + "|" + System.currentTimeMillis() + "|" + android.os.Process.myPid()).getBytes("UTF-8"));
+            String cur = readArmedList();
+            String list = pin;
+            String ts = String.valueOf(System.currentTimeMillis());
+            String pidStr = String.valueOf(android.os.Process.myPid());
+            if (cur != null) {
+                int i1 = cur.indexOf('|');
+                String tail = cur.substring(i1 + 1);
+                String oldPid = tail.substring(tail.lastIndexOf('|') + 1);
+                if (oldPid.equals(pidStr)) {
+                    // 同进程：保留原时间戳与旧 pin 列表，追加本 pin
+                    ts = tail.substring(0, tail.lastIndexOf('|'));
+                    StringBuilder b = new StringBuilder();
+                    for (String p : cur.substring(0, i1).split(",")) {
+                        if (p.isEmpty() || p.equals(pin)) continue;
+                        if (b.length() > 0) b.append(',');
+                        b.append(p);
+                    }
+                    if (b.length() > 0) b.append(',');
+                    list = b.append(pin).toString();
+                }
+            }
+            writeAtomic(guardArmedFile(), (list + "|" + ts + "|" + pidStr).getBytes("UTF-8"));
         } catch (Throwable t) {
             diag("guard_armed write FAIL", t);
         }
     }
 
-    private static void disarmGuardInit() {
+    private static String readArmedList() {
         try {
-            //noinspection ResultOfMethodCallIgnored
-            guardArmedFile().delete();
+            File f = guardArmedFile();
+            if (!f.exists() || f.length() == 0) return null;
+            String s = readText(f).trim();
+            return s.isEmpty() ? null : s;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 把 pin 从武装标记移除；列表空了就删文件。 */
+    private static void disarmGuardInit(String pin) {
+        try {
+            String cur = readArmedList();
+            if (cur == null) return;
+            int i1 = cur.indexOf('|');
+            StringBuilder list = new StringBuilder();
+            for (String p : cur.substring(0, i1).split(",")) {
+                if (p.isEmpty() || p.equals(pin)) continue;
+                if (list.length() > 0) list.append(',');
+                list.append(p);
+            }
+            if (list.length() == 0) {
+                //noinspection ResultOfMethodCallIgnored
+                guardArmedFile().delete();
+            } else {
+                String tail = cur.substring(i1);
+                writeAtomic(guardArmedFile(), (list + tail).getBytes("UTF-8"));
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -848,18 +867,21 @@ public class JarLoader {
     }
 
     public Spider getSpider(String key, String api, String ext, String jar) {
+        String jaKey = Util.md5(jar);
+        String spKey = jaKey + key;
+        if (spiders.containsKey(spKey)) return spiders.get(spKey);
+        if (!loaders.containsKey(jaKey)) parseJar(jaKey, jar);
+        DexClassLoader loader = loaders.get(jaKey);
+        if (loader == null) {
+            // 原来是直接 loaders.get(jaKey).loadClass(...) → NPE，
+            // 被外层 catch 吞掉后只剩一个毫无信息的 SpiderNull
+            diag("spider unavailable, jar not loaded: " + jar);
+            return new SpiderNull();
+        }
+        // 崩溃监控不在这一层（v279 build10）：讴歌实证「第一个爬虫实例化成功」不代表干净，
+        // 致命的 dvmInitClass 崩在首页遍历后面的站点上。装载层已 armed，homeContent 走完
+        // 由 markHomeOk() 统一实证解除。
         try {
-            String jaKey = Util.md5(jar);
-            String spKey = jaKey + key;
-            if (spiders.containsKey(spKey)) return spiders.get(spKey);
-            if (!loaders.containsKey(jaKey)) parseJar(jaKey, jar);
-            DexClassLoader loader = loaders.get(jaKey);
-            if (loader == null) {
-                // 原来是直接 loaders.get(jaKey).loadClass(...) → NPE，
-                // 被外层 catch 吞掉后只剩一个毫无信息的 SpiderNull
-                diag("spider unavailable, jar not loaded: " + jar);
-                return new SpiderNull();
-            }
             Spider spider = (Spider) loader.loadClass("com.github.catvod.spider." + api.split("csp_")[1]).newInstance();
             spider.init(App.get(), ext);
             spiders.put(spKey, spider);
@@ -867,6 +889,19 @@ public class JarLoader {
         } catch (Throwable e) {
             diag("getSpider FAIL key=" + key + " api=" + api, e);
             return new SpiderNull();
+        }
+    }
+
+    /**
+     * 首页流程完整走完（配置解析 → 各 jar 装载 → 各站点 homeContent 成功返回）后调用：
+     * 所有已装载 jar 实证通过，解除武装。之后这些 jar 再崩（极少数深层路径）不在监控范围，
+     * 属已知取舍——否则无法区分「崩在哪个 jar」。
+     */
+    public static void markHomeOk() {
+        for (String pin : JAR_PINS.values()) {
+            if (SPIDER_PROVEN.containsKey(pin)) continue;
+            SPIDER_PROVEN.put(pin, Boolean.TRUE);
+            disarmGuardInit(pin);
         }
     }
 

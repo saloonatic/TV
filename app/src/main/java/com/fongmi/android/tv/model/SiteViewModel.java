@@ -74,29 +74,37 @@ public class SiteViewModel extends ViewModel {
     public void homeContent() {
         execute(result, () -> {
             Site site = VodConfig.get().getHome();
+            Result value;
             if (site.getType() == 3) {
                 Spider spider = site.recent().spider();
                 String homeContent = spider.homeContent(true);
                 JarLoader.note("homeContent -> " + brief(homeContent));
                 SpiderDebug.log(homeContent);
                 Result result = Result.fromJson(homeContent);
-                if (result.getList().size() > 0) return result;
-                String homeVideoContent = spider.homeVideoContent();
-                JarLoader.note("homeVideoContent -> " + brief(homeVideoContent));
-                SpiderDebug.log(homeVideoContent);
-                result.setList(Result.fromJson(homeVideoContent).getList());
-                return result;
+                if (result.getList().size() > 0) {
+                    value = result;
+                } else {
+                    String homeVideoContent = spider.homeVideoContent();
+                    JarLoader.note("homeVideoContent -> " + brief(homeVideoContent));
+                    SpiderDebug.log(homeVideoContent);
+                    result.setList(Result.fromJson(homeVideoContent).getList());
+                    value = result;
+                }
             } else if (site.getType() == 4) {
                 ArrayMap<String, String> params = new ArrayMap<>();
                 params.put("filter", "true");
                 String homeContent = call(site, params, false);
                 SpiderDebug.log(homeContent);
-                return Result.fromJson(homeContent);
+                value = Result.fromJson(homeContent);
             } else {
                 String homeContent = OkHttp.newCall(site.getApi(), site.getHeaders()).execute().body().string();
                 SpiderDebug.log(homeContent);
-                return fetchPic(site, Result.fromType(site.getType(), homeContent));
+                value = fetchPic(site, Result.fromType(site.getType(), homeContent));
             }
+            // 首页流程完整走完 = 参与本次装载的所有 jar 冷路径实证通过，解除崩溃监控武装
+            //（v279 build10：讴歌实证致命 dvmInitClass 崩在首页遍历深处，「首个爬虫成功」不算数）
+            JarLoader.markHomeOk();
+            return value;
         });
     }
 
