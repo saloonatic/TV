@@ -11,7 +11,7 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
-    <uses-sdk tools:overrideLibrary="com.whl.quickjs.android,androidx.media3.common,androidx.media3.exoplayer,androidx.media3.exoplayer.dash,androidx.media3.exoplayer.hls,androidx.media3.exoplayer.rtsp,androidx.media3.exoplayer.smoothstreaming,androidx.media3.ui,androidx.media3.datasource,androidx.media3.datasource.okhttp,androidx.media3.datasource.rtmp,androidx.media3.extractor,androidx.media3.decoder,androidx.media3.container" />
+    <uses-sdk tools:overrideLibrary="com.whl.quickjs.android,androidx.media3.common,androidx.media3.exoplayer,androidx.media3.exoplayer.dash,androidx.media3.exoplayer.hls,androidx.media3.exoplayer.rtsp,androidx.media3.exoplayer.smoothstreaming,androidx.media3.ui,androidx.media3.datasource,androidx.media3.datasource.okhttp,androidx.media3.datasource.rtmp,androidx.media3.extractor,androidx.media3.decoder,androidx.media3.container,androidx.media3.database,androidx.media3.session,androidx.media3.muxer" />
 
     <queries>
         <package android:name="idm.internet.download.manager.plus" />

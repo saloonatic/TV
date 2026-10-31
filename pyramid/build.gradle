@@ -4,18 +4,19 @@ plugins {
 }
 
 android {
-    compileSdk 33
+    compileSdk 34
 
     defaultConfig {
         minSdk 16
         targetSdk 28
         ndk { abiFilters "armeabi-v7a" }
         python {
-            buildPython "C:/Users/FongMi/AppData/Local/Programs/Python/Python38/python.exe"
+            buildPython "/usr/bin/python3"
             pip {
                 install "lxml"
                 install "ujson"
-                install "pyquery"
+                install "pyquery==1.4.3"
+                install "cssselect==1.2.0"
                 install "requests"
                 install "jsonpath"
                 install 'pycryptodome'

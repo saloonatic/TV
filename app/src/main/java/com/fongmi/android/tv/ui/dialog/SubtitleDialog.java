@@ -69,29 +69,33 @@ public final class SubtitleDialog extends BaseDialog {
     }
 
     private void onUp(View view) {
-        subtitleView.addBottomPadding(0.005f);
-        Setting.putSubtitleBottomPadding(subtitleView.getBottomPadding());
+        float v = Math.min(0.5f, Setting.getSubtitleBottomPadding() + 0.005f);
+        Setting.putSubtitleBottomPadding(v);
+        subtitleView.setBottomPaddingFraction(v);
     }
 
     private void onDown(View view) {
-        subtitleView.subBottomPadding(0.005f);
-        Setting.putSubtitleBottomPadding(subtitleView.getBottomPadding());
+        float v = Math.max(0f, Setting.getSubtitleBottomPadding() - 0.005f);
+        Setting.putSubtitleBottomPadding(v);
+        subtitleView.setBottomPaddingFraction(v);
     }
 
     private void onLarge(View view) {
-        subtitleView.addTextSize(0.002f);
-        Setting.putSubtitleTextSize(subtitleView.getTextSize());
+        float v = Math.min(0.3f, Setting.getSubtitleTextSize() + 0.002f);
+        Setting.putSubtitleTextSize(v);
+        subtitleView.setFractionalTextSize(v);
     }
 
     private void onSmall(View view) {
-        subtitleView.subTextSize(0.002f);
-        Setting.putSubtitleTextSize(subtitleView.getTextSize());
+        float v = Math.max(0.01f, Setting.getSubtitleTextSize() - 0.002f);
+        Setting.putSubtitleTextSize(v);
+        subtitleView.setFractionalTextSize(v);
     }
 
     private void onReset(View view) {
         Setting.putSubtitleTextSize(0);
         Setting.putSubtitleBottomPadding(0);
-        subtitleView.setUserDefaultTextSize();
+        subtitleView.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION);
         subtitleView.setBottomPaddingFraction(SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION);
     }
 
