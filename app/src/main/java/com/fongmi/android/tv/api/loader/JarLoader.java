@@ -1,6 +1,7 @@
 package com.fongmi.android.tv.api.loader;
 
 import android.content.Context;
+import android.content.Intent;
 import android.os.Build;
 import android.util.Log;
 
@@ -18,6 +19,7 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -67,6 +69,24 @@ public class JarLoader {
      * 17:08:06 二次 init；17:08:08 崩。进程重启后 17:08:14 再 init 又成功了。
      */
     private static final ConcurrentHashMap<String, DexClassLoader> GUARD_INITED = new ConcurrentHashMap<>();
+
+    /**
+     * 进程级：{@code Init.init} 跑完了但没解出 loader 的壳（多半是壳在 4.3 上根本解不动，
+     * native 失败只写自己的日志）。
+     *
+     * <p><b>为什么必须记：</b>v277 的 pin 只在成功时生效，失败不拦 —— 王二小（wex 壳）实证：
+     * 首次 init「正常返回」但 {@code Init.loader()==null}，之后每次取爬虫都重新 init 同一个壳，
+     * 第二次起直接 SIGSEGV（fault addr 0，tombstone #01 落在 {@code cache/.wexfnw3ap67hn947}）。
+     * 失败原因基本是确定性的，重试只会崩，所以一次失败就跳过到进程结束。
+     * 换成新版本的壳时 jar 内容变化 → pin（md5）变化，自然恢复尝试。
+     */
+    private static final ConcurrentHashMap<String, Boolean> GUARD_FAILED = new ConcurrentHashMap<>();
+
+    /** dex 字符串池里出现即说明引用了 4.3 上不存在的 API 24/26 类（类初始化直接 dvmAbort）。 */
+    private static final String[] API24_TOKENS = {"Ljava/nio/file/", "Ljava/time/", "Ljava/util/stream/"};
+
+    /** 防止重复调度进程重启。 */
+    private static volatile boolean restartScheduled = false;
 
     /** 串行化「打补丁 + 建 loader + Init.init」整段，避免两个线程同时首次初始化同一个壳。 */
     private static final Object GUARD_LOCK = new Object();
@@ -133,6 +153,33 @@ public class JarLoader {
             return;
         }
 
+        // 防崩补丁（v279）：这个壳在本进程已经 init 失败过，绝不能再 Init.init 第二次。
+        // 详见 GUARD_FAILED 注释（王二小/wex 实证的 SIGSEGV）。
+        if (GUARD_FAILED.containsKey(pin)) {
+            diag("guard init failed earlier in this process, skip (avoid 2nd Init.init SIGSEGV): " + file.getName());
+            return;
+        }
+
+        // 跨进程崩溃记忆（v279 build8）：壳的 Init.init 可能直接 dvmAbort（王二小 wex 壳实证：
+        // 新进程**第一次** init 就崩，tombstone fault addr deadd00d），进程级 GUARD_FAILED 根本
+        // 来不及生效。对策分两层：
+        //   1) init 前武装 files/guard_armed（"<pin>|<ts>|<pid>"），init 返回后删除 ——
+        //      SIGSEGV 会跳过删除，文件留存即"上个进程死在 init 途中"的铁证；
+        //   2) 任何进程在入口发现**别的 pid** 的 armed 标记（10min 内），把该 pin 记入
+        //      files/guard_crashed 黑名单并清标记；黑名单命中的壳永久跳过（源其余 jar 不受影响）。
+        // pin 是壳 jar 内容 md5：源更新 jar → pin 变 → 黑名单自然失效 → 自动恢复尝试。
+        checkArmedMarker();
+
+        // 崩溃黑名单：有进程为这个壳死过，直接跳过
+        if (guardCrashedContains(pin)) {
+            GUARD_FAILED.put(pin, Boolean.TRUE);
+            diag("guard shell killed a previous process during init (crashed list), skip: " + file.getName());
+            if (notified.putIfAbsent("crash:" + pin, System.currentTimeMillis()) == null) {
+                App.post(() -> Notify.show("该源解码壳在 4.3 上初始化崩溃，已跳过"));
+            }
+            return;
+        }
+
         // 防护补丁：部分源爬虫（饭太硬/王二小等）内嵌 guard .so，在 Android 4.x 上
         // System.load 时 SIGSEGV（native 信号 try/catch 捕获不到），必须预检跳过。
         // 运行期开关：files/allow_native 存在则放行，用于实测这些 .so 到底能不能在 4.3 上跑。
@@ -161,6 +208,20 @@ public class JarLoader {
         }
         final DexClassLoader loader;
         ClassLoader guardReady = null;
+        // API 预检（v279）：无壳爬虫 jar 里若引用了 java.nio.file / java.time / java.util.stream
+        // （API 24/26），Dalvik 在类初始化时直接 dvmAbort（fault addr deadd00d），进程连异常都
+        // 抛不出来——讴歌/茶杯狐两个源实测一进首页就闪退、反复崩。在加载前扫 dex 字符串池，
+        // 命中就整包拒绝，把「闪退」变成「该源不可用」。
+        if (!guardNative) {
+            String hit = findBlockedApiRef(file);
+            if (hit != null) {
+                diag("skip jar, references API24+ class " + hit + " (dvmAbort on 4.3): " + file.getName());
+                if (notified.putIfAbsent("api:" + pin, System.currentTimeMillis()) == null) {
+                    App.post(() -> Notify.show("该源爬虫需要 Android 8+ 的 API，4.x 无法使用，已跳过"));
+                }
+                return;
+            }
+        }
         synchronized (GUARD_LOCK) {
             // 双检：并发的另一线程可能刚 init 完同一个壳，这里必须再看一次。
             DexClassLoader again = GUARD_INITED.get(pin);
@@ -168,6 +229,26 @@ public class JarLoader {
                 loaders.put(key, again);
                 diag("reuse guard-inited loader (concurrent), skip 2nd Init.init: " + file.getName());
                 putProxy(key);
+                return;
+            }
+            // 换壳补丁（v279）：本进程已经成功 init 过**另一个**壳。
+            // 实证（复现 2 次）：fty b83f1896 → fty 7573c6d1，第二次 init/purge/InitOrigin 全部
+            // "成功"、日志无任何报错，崩在之后第一次 homeContent（FongMi 自己的 CrashActivity，
+            // 无 tombstone）——同族不同版本的壳 .so 不能在同一进程共存。
+            // 对策：不 init、不 purge，直接重启进程；重启后 VodConfig 会自动加载新配置，
+            // 新壳在新进程里干净初始化。
+            // 只对「新的加固壳」生效：无壳 jar 不碰 cache/sharedb，与已 pin 的壳共存没问题
+            //（肥猫实测正常），绝不能为它重启进程。
+            if (guardNative && !GUARD_INITED.isEmpty() && !GUARD_INITED.containsKey(pin)) {
+                if (scheduleRestart()) {
+                    diag("different guard shell detected (pinned=" + GUARD_INITED.keySet() + ", new=" + pin + "), restart process instead of re-init");
+                    return;
+                }
+                // 冷启动会按「当前配置 + 历史记录」先后加载两个 jar，两个壳不同时会形成
+                // 重启循环（v279 首版真机实证：5969 → 6565 → … 每 40s 重启一次）。
+                // 防抖窗口内改为拒绝加载新壳（当作失败 pin 掉），保住已加载的那个。
+                GUARD_FAILED.put(pin, Boolean.TRUE);
+                diag("different guard shell but restart debounced, skip this shell in current process: " + file.getName());
                 return;
             }
             loader = new DexClassLoader(file.getAbsolutePath(), Path.jar().getAbsolutePath(), null, App.get().getClassLoader());
@@ -192,13 +273,20 @@ public class JarLoader {
                 // invokeInit 返回 true 只代表反射调用没抛异常，壳完全可能「正常返回但没解出 loader」
                 // （native 里失败只写自己的日志）。这种半死的壳一旦 pin 住，本进程内该源就永久坏掉，
                 // 所以必须再确认 Init.loader() 真是个 ClassLoader 才允许钉。
-                guardReady = invokeInit(key) ? guardLoader(loader) : null;
+                //武装标记（v279 build8）：若进程死在下面的 init 里（dvmAbort），guard_armed 留存，
+                // 下个进程据此把 pin 记入崩溃黑名单。正常返回（成功或优雅失败）都立即解除。
+                armGuardInit(pin);
+                boolean initOk = invokeInit(key);
+                disarmGuardInit();
+                guardReady = initOk ? guardLoader(loader) : null;
                 if (guardReady != null) {
                     // init 成功才钉住；失败的不缓存，留给下次重试（壳崩的时候进程已经没了，不在此列）
                     GUARD_INITED.put(pin, loader);
                     diag("guard loader pinned for process lifetime: " + file.getName());
                 } else {
-                    diag("guard init incomplete, NOT pinned (retry on next switch): " + file.getName());
+                    // v279：失败也要记下来。失败不拦的话，下一次取爬虫会再 init 同一个壳 → SIGSEGV
+                    GUARD_FAILED.put(pin, Boolean.TRUE);
+                    diag("guard init incomplete, marked failed for this process (no re-init, avoids SIGSEGV): " + file.getName());
                 }
             }
         }
@@ -262,6 +350,207 @@ public class JarLoader {
             }
         }
         return false;
+    }
+
+    /**
+     * 无壳爬虫 jar 的 API 预检：dex 的字符串池以 MUTF-8 存类描述符原文，所以直接按字节搜
+     * {@code Ljava/nio/file/} 之类的前缀即可。命中说明 jar 里<strong>某处</strong>引用了
+     * 4.3 上不存在的类——虽然未必执行到，但一旦执行到就是 dvmAbort（连异常都抛不出），
+     * 这类源在 4.3 上本来就没法用，整包拒绝换来「不闪退」。扫不了（坏 zip 等）就放行，
+     * 交给原有流程处理。
+     *
+     * @return 命中的 token，没命中返回 null
+     */
+    private static String findBlockedApiRef(File file) {
+        ZipFile zip = null;
+        try {
+            zip = new ZipFile(file);
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (!entry.getName().endsWith(".dex")) continue;
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                InputStream is = zip.getInputStream(entry);
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
+                is.close();
+                byte[] dex = bos.toByteArray();
+                for (String token : API24_TOKENS) {
+                    if (contains(dex, token.getBytes("UTF-8"))) return token;
+                }
+            }
+        } catch (Throwable e) {
+            diag("api scan skipped (unreadable jar): " + file.getName());
+            return null;
+        } finally {
+            if (zip != null) try {
+                zip.close();
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static boolean contains(byte[] data, byte[] pattern) {
+        if (pattern.length == 0 || data.length < pattern.length) return false;
+        outer:
+        for (int i = 0; i <= data.length - pattern.length; i++) {
+            for (int j = 0; j < pattern.length; j++) {
+                if (data[i + j] != pattern[j]) continue outer;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static String readText(File file) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        InputStream is = new FileInputStream(file);
+        byte[] buf = new byte[4096];
+        int n;
+        while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
+        is.close();
+        return new String(bos.toByteArray(), "UTF-8");
+    }
+
+    /**
+     * 进程自愈重启：先弹提示，延迟 600ms 后重启入口 Activity 并 SIGKILL 当前进程。
+     * 机制与 {@code Util.restartApp(Activity)} 同款（设置页已在用），区别只在不需要 Activity。
+     * 重启后 {@code VodConfig} 会自动加载最近一次配置——此时新壳尚未 init，正好在新进程里
+     * 干净地跑一次 {@code Init.init}。
+     *
+     * <p><b>防抖（必须持久化到文件）：</b>冷启动会按「当前配置 + 历史记录对应的配置」先后
+     * 加载两个 jar，若两者壳不同，重启后同样的顺序会再触发一遍 → 无限重启循环
+     * （v279 首版真机实证）。所以 90 秒内只允许重启一次，窗口内返回 false，
+     * 调用方把新壳 pin 成失败、保住已加载的壳。时间戳放文件而不是静态变量，
+     * 因为循环恰恰发生在「跨进程」的两跳之间。
+     *
+     * @return true=已调度重启（调用方应立即返回，进程即将消失）；false=窗口内，勿重启
+     */
+    private static boolean scheduleRestart() {
+        if (restartScheduled) return true;
+        File mark = new File(App.get().getFilesDir(), "guard_restart");
+        long now = System.currentTimeMillis();
+        try {
+            if (mark.exists() && mark.length() > 0 && now - Long.parseLong(readText(mark).trim()) < 90_000L) return false;
+        } catch (Throwable ignored) {
+        }
+        restartScheduled = true;
+        try {
+            writeAtomic(mark, String.valueOf(now).getBytes("UTF-8"));
+        } catch (Throwable t) {
+            diag("restart mark write FAIL", t);
+        }
+        App.post(() -> Notify.show("新源需要更换解码壳，正在重启应用…"));
+        App.post(() -> {
+            try {
+                Context ctx = App.get();
+                Intent launch = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName());
+                if (launch != null && launch.getComponent() != null) {
+                    ctx.startActivity(Intent.makeRestartActivityTask(launch.getComponent()));
+                } else {
+                    diag("restart: no launch intent, plain kill");
+                }
+            } catch (Throwable t) {
+                diag("restart schedule FAIL", t);
+            }
+            diag("restart process now");
+            // 必须用 killProcess（SIGKILL）：Runtime.exit() 会跑 shutdown hook，
+            // 真机上实测被 hook 卡住、旧进程杀不掉，留着还占着旧壳的 odex 映射。
+            android.os.Process.killProcess(android.os.Process.myPid());
+            System.exit(0);
+            // 延迟 3s 而不是立刻杀：配置级 spider jar 是在 parseConfig() 里下载的，此时
+            // config.json(object).update()（持久化新配置）还没执行——首版 600ms 实测重启后
+            // 又回到旧配置。反正本流程不会 init 新壳、旧壳完好，这 3s 内 homeContent 也安全。
+        }, 3000);
+        return true;
+    }
+
+    /**
+     * 跨进程崩溃记忆（v279 build8）。两个文件：
+     * <ul>
+     *   <li>{@code files/guard_armed} —— 武装标记，内容 {@code "<pin>|<ts>|<pid>"}。
+     *       壳首次 Init.init 前写入，正常返回后删除。SIGSEGV 跳过删除 → 留存即
+     *       「上个进程死在 init 途中」的铁证（王二小 wex 壳实证：fault addr deadd00d）。</li>
+     *   <li>{@code files/guard_crashed} —— 崩溃黑名单，每行一个 pin。入口发现别的 pid 的
+     *       armed 标记（10min 内，排除 force-stop 等陈旧残留）时把 pin 追加进来；
+     *       命中的壳永久跳过。pin 是壳 jar 内容 md5，源更新 jar → pin 变 → 自动解禁。</li>
+     * </ul>
+     * 误伤面：只有「进程恰好在 init 的 ~2s 窗口内被外部杀死」会误记健康壳，概率极低，
+     * 且可通过删除 guard_crashed 恢复；换来的是崩溃源永久静默跳过、不再弹崩溃框。
+     */
+    private static File guardArmedFile() {
+        return new File(App.get().getFilesDir(), "guard_armed");
+    }
+
+    private static File guardCrashedFile() {
+        return new File(App.get().getFilesDir(), "guard_crashed");
+    }
+
+    /** 入口检查：上个进程留下的武装标记 → 记黑名单；本进程自己的标记 → 忽略（init 流程在管）。 */
+    private static void checkArmedMarker() {
+        try {
+            File f = guardArmedFile();
+            if (!f.exists() || f.length() == 0) return;
+            String s = readText(f).trim();
+            int i1 = s.indexOf('|'), i2 = s.lastIndexOf('|');
+            if (i1 <= 0 || i2 <= i1) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+                return;
+            }
+            String pin = s.substring(0, i1);
+            long ts = Long.parseLong(s.substring(i1 + 1, i2));
+            int pid = Integer.parseInt(s.substring(i2 + 1));
+            if (pid == android.os.Process.myPid()) return;
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+            if (System.currentTimeMillis() - ts > 600_000L) {
+                diag("stale guard_armed (>10min, external kill?), discarded: " + pin);
+                return;
+            }
+            guardCrashedAdd(pin);
+            diag("guard shell killed previous process (pid " + pid + ") during init, blacklisted: " + pin);
+        } catch (Throwable t) {
+            diag("checkArmedMarker FAIL", t);
+        }
+    }
+
+    private static void armGuardInit(String pin) {
+        try {
+            writeAtomic(guardArmedFile(), (pin + "|" + System.currentTimeMillis() + "|" + android.os.Process.myPid()).getBytes("UTF-8"));
+        } catch (Throwable t) {
+            diag("guard_armed write FAIL", t);
+        }
+    }
+
+    private static void disarmGuardInit() {
+        try {
+            //noinspection ResultOfMethodCallIgnored
+            guardArmedFile().delete();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void guardCrashedAdd(String pin) {
+        try {
+            File f = guardCrashedFile();
+            String cur = f.exists() && f.length() > 0 ? readText(f) : "";
+            if (cur.contains(pin)) return;
+            writeAtomic(f, (cur + (cur.endsWith("\n") || cur.isEmpty() ? "" : "\n") + pin + "\n").getBytes("UTF-8"));
+        } catch (Throwable t) {
+            diag("guard_crashed write FAIL", t);
+        }
+    }
+
+    private static boolean guardCrashedContains(String pin) {
+        try {
+            File f = guardCrashedFile();
+            return f.exists() && f.length() > 0 && readText(f).contains(pin);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**
