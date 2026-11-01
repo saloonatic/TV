@@ -6,6 +6,7 @@ import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.R;
 import com.fongmi.android.tv.api.Decoder;
 import com.fongmi.android.tv.api.loader.BaseLoader;
+import com.fongmi.android.tv.api.loader.JarLoader;
 import com.fongmi.android.tv.bean.Config;
 import com.fongmi.android.tv.bean.Depot;
 import com.fongmi.android.tv.bean.Parse;
@@ -120,6 +121,8 @@ public class VodConfig {
 
     private void loadConfig(Callback callback) {
         try {
+            // 崩溃黑名单的作用域 = 当前配置：同 jar 在不同源里命运不同，不能跨源共用（v279）
+            JarLoader.setConfigKey(config.getUrl());
             checkJson(Json.parse(Decoder.getJson(config.getUrl())).getAsJsonObject(), callback);
         } catch (Throwable e) {
             if (TextUtils.isEmpty(config.getUrl())) App.post(() -> callback.error(""));
@@ -138,6 +141,8 @@ public class VodConfig {
     }
 
     private void loadConfigCache(Callback callback) {
+        // 走缓存（冷启动快路径）时同样要设作用域，否则黑名单退化成全局
+        JarLoader.setConfigKey(config.getUrl());
         if (!TextUtils.isEmpty(config.getJson()) && config.isCache()) checkJson(Json.parse(config.getJson()).getAsJsonObject(), callback);
         else loadConfig(callback);
     }

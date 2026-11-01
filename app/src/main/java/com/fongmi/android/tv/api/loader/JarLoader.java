@@ -3,6 +3,7 @@ package com.fongmi.android.tv.api.loader;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
+import android.text.TextUtils;
 import android.util.Log;
 
 import com.fongmi.android.tv.App;
@@ -84,6 +85,18 @@ public class JarLoader {
 
     /** loaders 的 key（通常是 jar URL 的 md5）→ 壳/jar 内容 pin（files md5），getSpider 回查用。 */
     private static final ConcurrentHashMap<String, String> JAR_PINS = new ConcurrentHashMap<>();
+
+    /**
+     * 当前配置的标识（配置 URL 的 md5，空串=未知）。崩溃黑名单按它隔离：
+     * 同一 jar 在 A 源里崩、在 B 源里可能是好的（崩不崩取决于遍历到哪个站点），
+     * 全局黑名单会跨源误伤（emulator 实证：clewm jar 在讴歌崩过，叙白饭太硬下首页正常）。
+     */
+    private static volatile String CONFIG_KEY = "";
+
+    /** 由 VodConfig 在每次解析配置前调用，给黑名单划定作用域。 */
+    public static void setConfigKey(String url) {
+        CONFIG_KEY = TextUtils.isEmpty(url) ? "" : Util.md5(url);
+    }
 
     /**
      * 已经在本设备上「实证可用」的 jar pin：至少一个爬虫类成功实例化过。
@@ -194,16 +207,6 @@ public class JarLoader {
             return;
         }
 
-        // 装载即武装（v279 build10）：把本 jar 的 pin 写进 guard_armed，进程若在「装载 →
-        // 首页流程走完」之间硬崩（dvmAbort 连异常都抛不出），下个进程凭标记把 pin 拉黑。
-        // 出口三选一：壳 Init 成功 / homeContent 成功（markHomeOk）/ 120s 定时器兜底
-        //（浏览页后很久才进首页的场景，别让标记挂着过夜）。
-        if (!SPIDER_PROVEN.containsKey(pin)) {
-            armGuardInit(pin);
-            App.post(() -> disarmGuardInit(pin), 120_000);
-            diag("jar armed for crash watch: " + file.getName());
-        }
-
         // 防护补丁：部分源爬虫（饭太硬/王二小等）内嵌 guard .so，在 Android 4.x 上
         // System.load 时 SIGSEGV（native 信号 try/catch 捕获不到），必须预检跳过。
         // 运行期开关：files/allow_native 存在则放行，用于实测这些 .so 到底能不能在 4.3 上跑。
@@ -269,6 +272,18 @@ public class JarLoader {
                 diag("different guard shell but restart debounced, skip this shell in current process: " + file.getName());
                 return;
             }
+            // 装载即武装（v279 build10）：把本 jar 的 pin 写进 guard_armed，进程若在「装载类 →
+            // 首页流程走完」之间硬崩（dvmAbort 连异常都抛不出），下个进程凭标记把 pin 拉黑。
+            // 出口三选一：壳 Init 成功 / homeContent 成功（markHomeOk）/ 120s 定时器兜底
+            //（浏览页后很久才进首页的场景，别让标记挂着过夜）。
+            // ★ 位置很关键：必须放在换壳重启 / 原生库跳过等「主动退出」分支**之后**。
+            //   build10 首版放在入口，换壳时新壳先被武装 → 紧接着我们自己 killProcess 重启 →
+            //   下个进程把健康的新壳当崩溃拉黑，源永久失效（换壳重启恰恰是常见路径）。
+            if (!SPIDER_PROVEN.containsKey(pin)) {
+                armGuardInit(pin);
+                App.post(() -> disarmGuardInit(pin), 120_000);
+                diag("jar armed for crash watch: " + file.getName());
+            }
             loader = new DexClassLoader(file.getAbsolutePath(), Path.jar().getAbsolutePath(), null, App.get().getClassLoader());
             loaders.put(key, loader);
             // 诊断：dexElements 是否为 0（4.3 的 DexPathList 会按后缀静默丢弃文件），
@@ -301,6 +316,7 @@ public class JarLoader {
                     // 壳 Init 成功 = 本 jar 冷路径实证通过，解除武装（后面的崩锅不归它背）
                     SPIDER_PROVEN.put(pin, Boolean.TRUE);
                     disarmGuardInit(pin);
+                    strikeClear(pin);
                 } else {
                     // v279：失败也要记下来。失败不拦的话，下一次取爬虫会再 init 同一个壳 → SIGSEGV
                     GUARD_FAILED.put(pin, Boolean.TRUE);
@@ -434,7 +450,7 @@ public class JarLoader {
     }
 
     /**
-     * 跨进程崩溃记忆（v279 build10）。两个文件：
+     * 跨进程崩溃记忆（v279 build10）。三个文件（{@code guard_armed} / {@code guard_crashed} / {@code guard_strikes}）：
      * <ul>
      *   <li>{@code files/guard_armed} —— 武装标记，内容 {@code "<pin,..>|<ts>|<pid>"}（pin 列表）。
      *       jar 装载时把自己 pin 加入（SIGKILL/SIGSEGV 都不会移除），三个出口移除：
@@ -443,8 +459,10 @@ public class JarLoader {
      *       里 dvmAbort —— 「首次爬虫成功」不算数，必须整个首页流程走完才算干净。</li>
      *   <li>{@code files/guard_crashed} —— 崩溃黑名单，每行一个 pin。下个进程发现**别的 pid**
      *       的 armed 标记（10min 内，排除 force-stop 等陈旧残留）时，把其中**未实证**的 pin
-     *       全部记入；命中的 jar 永久跳过。同一进程多 jar 全被拉黑属已知代价（崩溃进程无法
-     *       定位是哪个 jar 干的），pin 是 jar 内容 md5，源更新 → pin 变 → 自动解禁。</li>
+     *       记一次可疑（{@code files/guard_strikes}），**连续两次**才写进黑名单——应用层区分不了
+     *       dvmAbort 与 LMK 回收 / 用户退出 / 断网后首页失败，单次即拉黑会因一次巧合废掉健康源。
+     *       命中的 jar 跳过；同一进程多 jar 全被拉黑属已知代价（崩溃进程无法定位是哪个 jar 干的），
+     *       pin 是 jar 内容 md5，源更新 → pin 变 → 自动解禁；跑通首页会清零可疑计数。</li>
      * </ul>
      */
     private static File guardArmedFile() {
@@ -479,7 +497,16 @@ public class JarLoader {
             int blacklisted = 0;
             for (String pin : s.substring(0, i1).split(",")) {
                 if (pin.isEmpty() || SPIDER_PROVEN.containsKey(pin) || guardCrashedContains(pin)) continue;
+                // 两次命中才拉黑：进程死亡原因无法在应用层区分（dvmAbort / LMK 回收 / 用户退出 /
+                // 断网后首页失败被用户关掉，都表现为「armed 标记留存」）。单次就永久拉黑的话，
+                // 一次巧合就废掉一个健康源；连续两次才是可信信号（好 jar 之后跑通首页会清零）。
+                int n = strikeAdd(pin);
+                if (n < 2) {
+                    diag("suspect jar (strike " + n + "/2, process died while armed): " + pin);
+                    continue;
+                }
                 guardCrashedAdd(pin);
+                strikeClear(pin);
                 blacklisted++;
             }
             if (blacklisted > 0) diag("previous process (pid " + pid + ") died with armed jars, blacklisted " + blacklisted + " pin(s)");
@@ -556,8 +583,12 @@ public class JarLoader {
         try {
             File f = guardCrashedFile();
             String cur = f.exists() && f.length() > 0 ? readText(f) : "";
-            if (cur.contains(pin)) return;
-            writeAtomic(f, (cur + (cur.endsWith("\n") || cur.isEmpty() ? "" : "\n") + pin + "\n").getBytes("UTF-8"));
+            String entry = pin + "|" + CONFIG_KEY;
+            // 同一 pin 在同一配置下已记录就不重复写（跨配置各记一条，互不影响）
+            for (String line : cur.split("\n")) {
+                if (line.trim().equals(entry)) return;
+            }
+            writeAtomic(f, (cur + (cur.endsWith("\n") || cur.isEmpty() ? "" : "\n") + entry + "\n").getBytes("UTF-8"));
         } catch (Throwable t) {
             diag("guard_crashed write FAIL", t);
         }
@@ -566,9 +597,88 @@ public class JarLoader {
     private static boolean guardCrashedContains(String pin) {
         try {
             File f = guardCrashedFile();
-            return f.exists() && f.length() > 0 && readText(f).contains(pin);
+            if (!f.exists() || f.length() == 0) return false;
+            // 条目格式 "<pin>|<配置key>"：同一 jar 在不同源里表现可能不同（崩溃发生在遍历该源
+            // 自己的站点路径时），跨源共用黑名单会把好源一起废掉——emulator 实证：clewm jar
+            // 在讴歌里崩过，但在叙白饭太硬下 homeContent 正常返回 4433 字节。旧格式（无 |）当全局。
+            for (String line : readText(f).split("\n")) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                int sp = line.lastIndexOf('|');
+                String p = sp < 0 ? line : line.substring(0, sp);
+                String c = sp < 0 ? "" : line.substring(sp + 1);
+                if (!p.equals(pin)) continue;
+                if (c.isEmpty() || (!CONFIG_KEY.isEmpty() && c.equals(CONFIG_KEY))) return true;
+            }
+            return false;
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /** 可疑计数器：{@code files/guard_strikes}，每行 {@code "<pin> <count>"}。连击到 2 才进黑名单。 */
+    private static File guardStrikesFile() {
+        return new File(App.get().getFilesDir(), "guard_strikes");
+    }
+
+    private static int strikeAdd(String pin) {
+        try {
+            File f = guardStrikesFile();
+            String cur = f.exists() && f.length() > 0 ? readText(f) : "";
+            StringBuilder out = new StringBuilder();
+            int count = 0;
+            boolean found = false;
+            for (String line : cur.split("\n")) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                int sp = line.lastIndexOf(' ');
+                if (sp <= 0) continue;
+                String p = line.substring(0, sp);
+                if (p.equals(pin)) {
+                    count = Integer.parseInt(line.substring(sp + 1).trim()) + 1;
+                    found = true;
+                    out.append(pin).append(' ').append(count).append('\n');
+                } else {
+                    out.append(line).append('\n');
+                }
+            }
+            if (!found) {
+                count = 1;
+                out.append(pin).append(' ').append(count).append('\n');
+            }
+            writeAtomic(f, out.toString().getBytes("UTF-8"));
+            return count;
+        } catch (Throwable t) {
+            diag("guard_strikes FAIL", t);
+            return 0;
+        }
+    }
+
+    private static void strikeClear(String pin) {
+        try {
+            File f = guardStrikesFile();
+            if (!f.exists() || f.length() == 0) return;
+            String cur = readText(f);
+            StringBuilder out = new StringBuilder();
+            boolean changed = false;
+            for (String line : cur.split("\n")) {
+                String l = line.trim();
+                if (l.isEmpty()) continue;
+                int sp = l.lastIndexOf(' ');
+                if (sp > 0 && l.substring(0, sp).equals(pin)) {
+                    changed = true;
+                    continue;
+                }
+                out.append(l).append('\n');
+            }
+            if (!changed) return;
+            if (out.length() == 0) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            } else {
+                writeAtomic(f, out.toString().getBytes("UTF-8"));
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -902,6 +1012,8 @@ public class JarLoader {
             if (SPIDER_PROVEN.containsKey(pin)) continue;
             SPIDER_PROVEN.put(pin, Boolean.TRUE);
             disarmGuardInit(pin);
+            // 跑通首页 = 这一批 jar 实证干净，清掉历史可疑计数（断网/被回收造成的一次误判不再累计）
+            strikeClear(pin);
         }
     }
 
