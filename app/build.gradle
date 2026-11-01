@@ -32,6 +32,15 @@ android {
         viewBinding true
     }
 
+    // 精简（v279）：把随包的 X5 离线内核排除出 APK（assets/x5.tbs.apk，35MB）。
+    // 依据：TBS 新内核在 Android 4.x 上装不上——真机（乐视 4.4）app_tbs/core_private 里
+    // 只有 4 个 0 字节锁文件、core_share 为空，内核从未落地；解析仍走系统 WebView。
+    // 保留 tbssdk 依赖与 Tbs 代码（设置里关掉/开启 X5 解析都不会崩，只是本地安装会失败）。
+    // 需要重新内置 X5 时删掉这一段即可。
+    androidResources {
+        ignoreAssetsPattern "!x5.tbs.apk"
+    }
+
     buildTypes {
         release {
             // 首次移植先用不混淆，便于定位问题；稳定后再打开
